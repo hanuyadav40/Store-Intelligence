@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Purplle Store Intelligence</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f1a;
+      --card: #1a1a2e;
+      --border: #2d2d4e;
+      --accent: #7c3aed;
+      --accent2: #06b6d4;
+      --warn: #f59e0b;
+      --crit: #ef4444;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; min-height: 100vh; }
+    header { background: var(--card); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.25rem; font-weight: 700; color: var(--accent); }
+    header span { font-size: 0.85rem; color: var(--muted); }
+    #store-select { margin-left: auto; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.8rem; border-radius: 6px; font-size: 0.9rem; cursor: pointer; }
+    #status-badge { padding: 0.3rem 0.7rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; background: #166534; color: #86efac; }
+    #status-badge.degraded { background: #78350f; color: #fde68a; }
+    #status-badge.error { background: #7f1d1d; color: #fca5a5; }
+    main { padding: 2rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; }
+    .card h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.75rem; }
+    .stat { font-size: 2.5rem; font-weight: 700; color: var(--text); }
+    .stat-sub { font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
+    .full-width { grid-column: 1 / -1; }
+    canvas { max-height: 220px; }
+    #anomaly-list { list-style: none; display: flex; flex-direction: column; gap: 0.5rem; }
+    #anomaly-list li { padding: 0.6rem 0.9rem; border-radius: 8px; font-size: 0.85rem; border-left: 4px solid var(--accent); background: rgba(124,58,237,0.08); }
+    #anomaly-list li.WARN { border-color: var(--warn); background: rgba(245,158,11,0.08); }
+    #anomaly-list li.CRITICAL { border-color: var(--crit); background: rgba(239,68,68,0.08); }
+    #anomaly-list li .sev { font-weight: 700; margin-right: 0.4rem; }
+    #anomaly-list li .action { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
+    .heatmap-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.5rem; margin-top: 0.5rem; }
+    .heatmap-cell { border-radius: 8px; padding: 0.6rem; text-align: center; font-size: 0.8rem; font-weight: 600; transition: opacity 0.4s; }
+    .heatmap-cell .score { font-size: 1.2rem; display: block; }
+    #last-updated { font-size: 0.75rem; color: var(--muted); margin-top: 0.3rem; }
+    footer { text-align: center; padding: 1.5rem; color: var(--muted); font-size: 0.75rem; border-top: 1px solid var(--border); margin-top: 1rem; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Purplle Store Intelligence</h1>
+  <span>Real-time retail analytics</span>
+  <select id="store-select">
+    <option value="STORE_BLR_001">Bangalore 001</option>
+    <option value="STORE_BLR_002">Bangalore 002</option>
+    <option value="STORE_MUM_001">Mumbai 001</option>
+    <option value="STORE_DEL_001">Delhi 001</option>
+    <option value="STORE_HYD_001">Hyderabad 001</option>
+  </select>
+  <div id="status-badge">LIVE</div>
+</header>
+
+<main>
+  <!-- KPI cards -->
+  <div class="card">
+    <h2>Unique Visitors Today</h2>
+    <div class="stat" id="kpi-visitors">—</div>
+    <div class="stat-sub" id="kpi-visitors-sub">loading…</div>
+  </div>
+  <div class="card">
+    <h2>Conversion Rate</h2>
+    <div class="stat" id="kpi-conversion">—</div>
+    <div class="stat-sub">visitors who purchased</div>
+  </div>
+  <div class="card">
+    <h2>Current Queue Depth</h2>
+    <div class="stat" id="kpi-queue">—</div>
+    <div class="stat-sub">billing counter</div>
+  </div>
+  <div class="card">
+    <h2>Abandonment Rate</h2>
+    <div class="stat" id="kpi-abandon">—</div>
+    <div class="stat-sub">left billing queue</div>
+  </div>
+  <div class="card">
+    <h2>Total Transactions</h2>
+    <div class="stat" id="kpi-transactions">—</div>
+    <div class="stat-sub">POS-confirmed</div>
+  </div>
+
+  <!-- Funnel chart -->
+  <div class="card full-width">
+    <h2>Conversion Funnel</h2>
+    <canvas id="funnel-chart"></canvas>
+  </div>
+
+  <!-- Dwell chart -->
+  <div class="card full-width">
+    <h2>Avg Dwell by Zone (ms)</h2>
+    <canvas id="dwell-chart"></canvas>
+  </div>
+
+  <!-- Heatmap -->
+  <div class="card full-width">
+    <h2>Zone Visit Heatmap</h2>
+    <div id="heatmap-grid" class="heatmap-grid"></div>
+    <div id="last-updated"></div>
+  </div>
+
+  <!-- Anomalies -->
+  <div class="card full-width">
+    <h2>Active Anomalies</h2>
+    <ul id="anomaly-list"><li>Loading…</li></ul>
+  </div>
+</main>
+
+<footer>Store Intelligence API — Purplle Apex Hiring Challenge</footer>
+
+<script>
+  const storeSelect = document.getElementById('store-select');
+  let currentStore = storeSelect.value;
+  let sseSource = null;
+
+  // --- Chart instances ---
+  let funnelChart = null;
+  let dwellChart = null;
+
+  function initCharts() {
+    const funnelCtx = document.getElementById('funnel-chart').getContext('2d');
+    funnelChart = new Chart(funnelCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label: 'Visitors', data: [], backgroundColor: '#7c3aed' }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+
+    const dwellCtx = document.getElementById('dwell-chart').getContext('2d');
+    dwellChart = new Chart(dwellCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label: 'Avg Dwell (ms)', data: [], backgroundColor: '#06b6d4' }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+  }
+
+  // --- Data fetchers ---
+  async function fetchJSON(path) {
+    const res = await fetch(path);
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${path}`);
+    return res.json();
+  }
+
+  async function refreshMetrics(data) {
+    document.getElementById('kpi-visitors').textContent = data.unique_visitors ?? '—';
+    document.getElementById('kpi-visitors-sub').textContent = `as of ${data.as_of ? data.as_of.slice(0, 19) : '—'}`;
+    document.getElementById('kpi-conversion').textContent =
+      data.conversion_rate != null ? (data.conversion_rate * 100).toFixed(1) + '%' : '—';
+    document.getElementById('kpi-queue').textContent = data.current_queue_depth ?? '—';
+    document.getElementById('kpi-abandon').textContent =
+      data.abandonment_rate != null ? (data.abandonment_rate * 100).toFixed(1) + '%' : '—';
+    document.getElementById('kpi-transactions').textContent = data.total_transactions ?? '—';
+
+    // Dwell chart
+    const zones = data.avg_dwell_per_zone || [];
+    dwellChart.data.labels = zones.map(z => z.zone_id);
+    dwellChart.data.datasets[0].data = zones.map(z => z.avg_dwell_ms);
+    dwellChart.update();
+  }
+
+  async function refreshFunnel() {
+    try {
+      const data = await fetchJSON(`/funnel/${currentStore}`);
+      const stages = data.stages || [];
+      funnelChart.data.labels = stages.map(s => s.label);
+      funnelChart.data.datasets[0].data = stages.map(s => s.count);
+      funnelChart.update();
+    } catch (e) { console.warn('Funnel fetch failed', e); }
+  }
+
+  async function refreshHeatmap() {
+    try {
+      const data = await fetchJSON(`/heatmap/${currentStore}`);
+      const grid = document.getElementById('heatmap-grid');
+      grid.innerHTML = '';
+      const zones = data.zones || [];
+      zones.forEach(z => {
+        const cell = document.createElement('div');
+        cell.className = 'heatmap-cell';
+        const score = z.normalised_score;
+        // Interpolate colour: low = blue, high = red
+        const r = Math.round(score * 2.55);
+        const b = Math.round((100 - score) * 2.55);
+        cell.style.background = `rgba(${r}, 40, ${b}, 0.7)`;
+        cell.innerHTML = `<span class="score">${score.toFixed(0)}</span>${z.zone_id}`;
+        grid.appendChild(cell);
+      });
+      document.getElementById('last-updated').textContent =
+        data.date ? `Date: ${data.date}` + (data.data_confidence ? '' : ' ⚠ low confidence') : '';
+    } catch (e) { console.warn('Heatmap fetch failed', e); }
+  }
+
+  async function refreshAnomalies() {
+    try {
+      const data = await fetchJSON(`/anomalies/${currentStore}`);
+      const list = document.getElementById('anomaly-list');
+      const items = data.anomalies || [];
+      if (!items.length) {
+        list.innerHTML = '<li style="color:var(--muted)">No active anomalies</li>';
+        return;
+      }
+      list.innerHTML = items.map(a => `
+        <li class="${a.severity}">
+          <span class="sev">[${a.severity}] ${a.anomaly_type}</span>${a.description}
+          <div class="action">${a.suggested_action}</div>
+        </li>`).join('');
+    } catch (e) { console.warn('Anomalies fetch failed', e); }
+  }
+
+  // --- SSE connection ---
+  function connectSSE() {
+    if (sseSource) { sseSource.close(); sseSource = null; }
+    const badge = document.getElementById('status-badge');
+    sseSource = new EventSource(`/stream/${currentStore}`);
+
+    sseSource.onmessage = async (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data._event === 'metrics') {
+          await refreshMetrics(data);
+          await refreshFunnel();
+          await refreshHeatmap();
+          await refreshAnomalies();
+          badge.textContent = 'LIVE';
+          badge.className = '';
+        }
+      } catch (e) { console.warn('SSE parse error', e); }
+    };
+
+    sseSource.onerror = () => {
+      badge.textContent = 'RECONNECTING';
+      badge.className = 'degraded';
+    };
+  }
+
+  // --- Store selector ---
+  storeSelect.addEventListener('change', () => {
+    currentStore = storeSelect.value;
+    connectSSE();
+  });
+
+  // --- Initial load ---
+  initCharts();
+  connectSSE();
+
+  // Fallback poll every 30s in case SSE is not streaming
+  setInterval(async () => {
+    try {
+      const m = await fetchJSON(`/metrics/${currentStore}`);
+      await refreshMetrics(m);
+      await refreshFunnel();
+      await refreshHeatmap();
+      await refreshAnomalies();
+    } catch(e) { /* silent */ }
+  }, 30000);
+</script>
+</body>
+</html>

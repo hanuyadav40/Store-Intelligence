@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: store_intelligence
+      POSTGRES_USER: si_user
+      POSTGRES_PASSWORD: si_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U si_user -d store_intelligence"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://si_user:si_password@postgres:5432/store_intelligence
+      SYNC_DATABASE_URL: postgresql+psycopg2://si_user:si_password@postgres:5432/store_intelligence
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+      SECRET_KEY: apex-retail-secret-key-change-in-production
+      STORE_LAYOUT_PATH: /app/data/store_layout.json
+      POS_DATA_PATH: /app/data/pos_transactions.csv
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.pipeline
+    environment:
+      API_BASE_URL: http://api:8000
+      CCTV_DIR: /data/cctv
+      STORE_LAYOUT_PATH: /app/data/store_layout.json
+    volumes:
+      - ../CCTV Footage:/data/cctv:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles:
+      - pipeline
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

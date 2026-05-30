@@ -1,0 +1,36 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+*.log
+*.db
+*.sqlite3
+.DS_Store
+Thumbs.db
+yolov8n.pt
+yolov8m.pt
+*.pt
+*.weights
+runs/
+# Video files — too large for git
+*.mp4
+*.avi
+*.mkv
+*.mov
+# Generated event output
+pipeline/output/
+data/events_output/

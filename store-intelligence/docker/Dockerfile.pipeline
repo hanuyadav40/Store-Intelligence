@@ -1,0 +1,33 @@
+FROM python:3.12.2-slim
+
+WORKDIR /app
+
+# Install system dependencies for OpenCV and video processing
+RUN apt-get update && apt-get install -y \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
+    libgl1-mesa-glx \
+    ffmpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libv4l-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pipeline requirements
+COPY requirements-pipeline.txt .
+RUN pip install --no-cache-dir -r requirements-pipeline.txt
+
+# Pre-download YOLOv8n weights
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
+# Copy pipeline code
+COPY pipeline/ ./pipeline/
+COPY data/ ./data/
+
+WORKDIR /app/pipeline
+
+CMD ["python", "detect.py", "--help"]
