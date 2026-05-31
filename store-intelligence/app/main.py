@@ -2,139 +2,145 @@
 FastAPI application entry point.
 
 Startup sequence:
-  1. configure_logging() — JSON logs before anything else
-  2. load_pos_data()     — idempotent CSV load into DB (runs every startup)
-  3. Routes mounted     — /events, /stores, /health, /dashboard/stream
-
-SSE endpoint /dashboard/stream/{store_id} emits a "tick" every 15 seconds
-with the latest store metrics so the live dashboard can update without polling.
+  1. Configure structured logging
+  2. Load Prometheus metrics
+  3. Load buyer count from sales CSV
+  4. Start background video / demo processor
+  5. Serve API
 """
-import asyncio
-import json
-import logging
+from __future__ import annotations
+
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import JSONResponse
 
-from app.config import get_settings
-from app.database import AsyncSessionLocal, async_engine as engine
-from app.ingestion import load_pos_data
-from app.logging_config import configure_logging
-from app.middleware import RequestLoggingMiddleware
-from app.models import Base
-from app.routers import events, health, stores
+from app.api.routes import router
+from app.services.state_manager import state_manager
+from app.services.video_processor import orchestrator
+from app.utils.config import settings
+from app.utils.logging_config import get_logger, setup_logging
+from analytics.metrics import load_buyers_from_csv
 
-configure_logging()
-logger = logging.getLogger("api.main")
-settings = get_settings()
+setup_logging()
+logger = get_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
-# Application lifespan
+# Prometheus metrics
 # ---------------------------------------------------------------------------
+
+if settings.ENABLE_PROMETHEUS:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
+    REQUEST_COUNT = Counter(
+        "store_api_requests_total",
+        "Total API requests",
+        ["method", "endpoint", "status"],
+    )
+    REQUEST_LATENCY = Histogram(
+        "store_api_request_latency_seconds",
+        "API request latency",
+        ["endpoint"],
+    )
+    FOOTFALL_GAUGE = Gauge("store_footfall_total", "Total footfall")
+    OCCUPANCY_GAUGE = Gauge("store_current_occupancy", "Current in-store occupancy")
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (replaces on_event startup/shutdown)
+# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting store-intelligence API", extra={"env": settings.environment})
+    # ---- startup ----
+    logger.info("app_starting", version=settings.APP_VERSION)
 
-    # Ensure tables exist (Alembic is preferred, but this is a safe fallback)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all, checkfirst=True)
+    # Load sales data for conversion rate
+    if settings.SALES_CSV_PATH:
+        buyers = load_buyers_from_csv(settings.SALES_CSV_PATH)
+        if buyers > 0:
+            state_manager.set_buyer_count(buyers)
 
-    # Load POS transaction data (idempotent — skips already-loaded rows)
-    async with AsyncSessionLocal() as session:
-        await load_pos_data(settings.pos_data_path, session)
+    # Start video / demo processor
+    orchestrator.start()
 
-    logger.info("Startup complete — API is ready")
-    yield
-    logger.info("Shutting down store-intelligence API")
-
-
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Store Intelligence API",
-    description=(
-        "Retail analytics API for the Purplle/Apex store intelligence system. "
-        "Ingests structured events from CCTV detection pipeline and exposes "
-        "metrics, funnel, heatmap, anomaly, and health endpoints."
-    ),
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    lifespan=lifespan,
-)
-
-# CORS — permits dashboard (same origin in Docker) and local dev
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-app.add_middleware(RequestLoggingMiddleware)
-
-# ---------------------------------------------------------------------------
-# Routers
-# ---------------------------------------------------------------------------
-app.include_router(events.router)
-app.include_router(stores.router)
-app.include_router(health.router)
-
-
-# ---------------------------------------------------------------------------
-# Root redirect
-# ---------------------------------------------------------------------------
-@app.get("/", include_in_schema=False)
-async def root_redirect():
-    return RedirectResponse(url="/docs")
-
-
-# ---------------------------------------------------------------------------
-# SSE live dashboard stream
-# ---------------------------------------------------------------------------
-async def _metrics_stream(store_id: str) -> AsyncGenerator[dict, None]:
-    """
-    Yields a JSON payload every 15 seconds with the latest store metrics.
-    Clients reconnect automatically on disconnect (SSE spec).
-    """
-    from app.metrics import get_store_metrics
-
-    while True:
+    if settings.ENABLE_PROMETHEUS:
         try:
-            async with AsyncSessionLocal() as db:
-                metrics = await get_store_metrics(store_id, db)
-                payload = metrics.model_dump()
-                payload["_event"] = "metrics"
-                yield {"data": json.dumps(payload)}
-        except Exception as exc:
-            logger.warning(
-                "SSE metrics error",
-                extra={"store_id": store_id, "error": str(exc)},
-            )
-            yield {
-                "data": json.dumps(
-                    {
-                        "_event": "error",
-                        "store_id": store_id,
-                        "message": "metrics unavailable",
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-            }
+            start_http_server(settings.PROMETHEUS_PORT)
+            logger.info("prometheus_started", port=settings.PROMETHEUS_PORT)
+        except OSError:
+            logger.warning("prometheus_port_in_use", port=settings.PROMETHEUS_PORT)
 
-        await asyncio.sleep(15)
+    logger.info("app_ready", host=settings.HOST, port=settings.PORT)
+    yield
+
+    # ---- shutdown ----
+    orchestrator.stop()
+    logger.info("app_shutdown")
 
 
-@app.get(
-    "/dashboard/stream/{store_id}",
-    summary="Live metrics stream (SSE)",
-    description="Server-Sent Events stream. Emits a metrics tick every 15 s.",
-    tags=["dashboard"],
-)
-async def dashboard_stream(store_id: str, request: Request):
-    return EventSourceResponse(_metrics_stream(store_id))
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=settings.APP_NAME,
+        version=settings.APP_VERSION,
+        description="Store Intelligence API – person detection, tracking & metrics",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ---- Global exception handler ----
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.error(
+            "unhandled_exception",
+            path=str(request.url),
+            error=str(exc),
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "error": str(exc)},
+        )
+
+    # ---- Prometheus instrumentation middleware ----
+    if settings.ENABLE_PROMETHEUS:
+
+        @app.middleware("http")
+        async def prometheus_middleware(request: Request, call_next):
+            start = time.perf_counter()
+            response = await call_next(request)
+            elapsed = time.perf_counter() - start
+            endpoint = request.url.path
+
+            REQUEST_COUNT.labels(
+                method=request.method,
+                endpoint=endpoint,
+                status=response.status_code,
+            ).inc()
+            REQUEST_LATENCY.labels(endpoint=endpoint).observe(elapsed)
+
+            # Keep gauges fresh
+            snap = state_manager.get_metrics_snapshot()
+            FOOTFALL_GAUGE.set(snap["footfall"])
+            OCCUPANCY_GAUGE.set(snap["current_occupancy"])
+
+            return response
+
+    app.include_router(router)
+    return app
+
+
+app = create_app()

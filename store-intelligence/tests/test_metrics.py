@@ -1,91 +1,143 @@
-# PROMPT: Test store metrics endpoint. Validates unique visitor counting,
-# staff exclusion, conversion rate, and queue depth calculations.
-# Seeds database via the /events/ingest API endpoint.
-#
-# CHANGES MADE:
-# - Tests GET /stores/{store_id}/metrics
-# - Staff visitors are excluded from unique_visitors and conversion_rate
-# - Zero-traffic stores return safe default values (0s, not errors)
-
-import uuid
-
+"""
+Unit tests for business metrics and funnel computation.
+"""
+from datetime import datetime, timedelta
 import pytest
-from httpx import AsyncClient
 
-from tests.conftest import make_event
-
-STORE = "STORE_METRICS_TEST"
-
-
-async def _ingest(client: AsyncClient, events: list[dict]) -> None:
-    resp = await client.post("/events/ingest", json={"events": events})
-    assert resp.status_code == 200, resp.text
+from app.models.event_model import PersonEvent, EventType
+from app.services.state_manager import StateManager
+from analytics.metrics import compute_metrics
+from analytics.funnel import compute_funnel
 
 
-@pytest.mark.asyncio
-async def test_metrics_zero_traffic(client: AsyncClient):
-    """Store with no events returns safe zeros, not an error."""
-    resp = await client.get(f"/stores/{STORE}_EMPTY/metrics")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["unique_visitors"] == 0
-    assert data["conversion_rate"] == 0.0
-    assert data["current_queue_depth"] == 0
+def _state_with_events(events):
+    """Build a fresh StateManager, push events, return it."""
+    sm = StateManager()
+    for ev in events:
+        sm.add_event(ev)
+    return sm
 
 
-@pytest.mark.asyncio
-async def test_metrics_staff_excluded(client: AsyncClient):
-    """Staff visitor_ids must not be counted in unique_visitors."""
-    store = STORE + "_STAFF"
-    staff_id = str(uuid.uuid4())
-    visitor_id = str(uuid.uuid4())
-
-    await _ingest(client, [
-        make_event(store_id=store, visitor_id=staff_id, event_type="ENTRY", is_staff=True),
-        make_event(store_id=store, visitor_id=visitor_id, event_type="ENTRY", is_staff=False),
-    ])
-
-    resp = await client.get(f"/stores/{store}/metrics")
-    assert resp.status_code == 200
-    data = resp.json()
-    # Only 1 non-staff visitor
-    assert data["unique_visitors"] == 1
+def _entry(pid, ts, etype=EventType.ENTRY):
+    return PersonEvent(
+        person_id=pid,
+        timestamp=ts,
+        event_type=etype,
+        confidence=0.9,
+        camera_id="cam_01",
+    )
 
 
-@pytest.mark.asyncio
-async def test_metrics_queue_depth(client: AsyncClient):
-    """current_queue_depth should reflect the max billing queue_depth in last 10 min."""
-    store = STORE + "_QUEUE"
-    vid = str(uuid.uuid4())
-
-    await _ingest(client, [
-        make_event(store_id=store, visitor_id=vid, event_type="ENTRY"),
-        make_event(store_id=store, visitor_id=vid, event_type="BILLING_QUEUE_JOIN",
-                   zone_id="BILLING", queue_depth=7),
-    ])
-
-    resp = await client.get(f"/stores/{store}/metrics")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["current_queue_depth"] == 7
+def _exit(pid, ts):
+    return PersonEvent(
+        person_id=pid,
+        timestamp=ts,
+        event_type=EventType.EXIT,
+        confidence=0.9,
+        camera_id="cam_01",
+    )
 
 
-@pytest.mark.asyncio
-async def test_metrics_dwell_per_zone(client: AsyncClient):
-    """avg_dwell_per_zone should return correct zone stats."""
-    store = STORE + "_DWELL"
-    vid = str(uuid.uuid4())
+class TestStateManagerMetrics:
+    def test_footfall_counts_entries(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([_entry(1, t0), _entry(2, t0)])
+        snap = sm.get_metrics_snapshot()
+        assert snap["footfall"] == 2
 
-    await _ingest(client, [
-        make_event(store_id=store, visitor_id=vid, event_type="ENTRY"),
-        make_event(store_id=store, visitor_id=vid, event_type="ZONE_ENTER", zone_id="SKINCARE"),
-        make_event(store_id=store, visitor_id=vid, event_type="ZONE_DWELL",
-                   zone_id="SKINCARE", dwell_ms=30000),
-    ])
+    def test_unique_visitors_no_double_count(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        # Same person_id twice → still 1 unique visitor
+        sm = _state_with_events([_entry(1, t0), _entry(1, t0 + timedelta(minutes=1))])
+        snap = sm.get_metrics_snapshot()
+        assert snap["unique_visitors"] == 1
 
-    resp = await client.get(f"/stores/{store}/metrics")
-    assert resp.status_code == 200
-    data = resp.json()
-    zones = {z["zone_id"]: z for z in data["avg_dwell_per_zone"]}
-    assert "SKINCARE" in zones
-    assert zones["SKINCARE"]["avg_dwell_ms"] > 0
+    def test_reentry_not_counted_as_new_visitor(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([
+            _entry(1, t0),
+            _entry(1, t0 + timedelta(minutes=10), EventType.REENTRY),
+        ])
+        snap = sm.get_metrics_snapshot()
+        assert snap["unique_visitors"] == 1
+
+    def test_occupancy_increments_on_entry(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([_entry(1, t0), _entry(2, t0)])
+        snap = sm.get_metrics_snapshot()
+        assert snap["current_occupancy"] == 2
+
+    def test_occupancy_decrements_on_exit(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([_entry(1, t0), _exit(1, t0 + timedelta(minutes=5))])
+        snap = sm.get_metrics_snapshot()
+        assert snap["current_occupancy"] == 0
+
+    def test_occupancy_never_negative(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([_exit(99, t0)])  # exit without prior entry
+        snap = sm.get_metrics_snapshot()
+        assert snap["current_occupancy"] >= 0
+
+    def test_dwell_time_recorded_on_exit(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = StateManager()
+        sm.add_event(_entry(1, t0))
+        sm.record_exit_dwell(1, t0 + timedelta(minutes=10))
+        snap = sm.get_metrics_snapshot()
+        assert snap["avg_dwell_time"] == pytest.approx(600.0, rel=0.01)
+
+    def test_conversion_rate_with_buyers(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = StateManager()
+        for pid in range(1, 11):  # 10 unique visitors
+            sm.add_event(_entry(pid, t0))
+        sm.set_buyer_count(3)
+        snap = sm.get_metrics_snapshot()
+        assert snap["conversion_rate"] == pytest.approx(0.3, rel=0.01)
+
+    def test_staff_event_adds_to_staff_set(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([
+            PersonEvent(
+                person_id=99,
+                timestamp=t0,
+                event_type=EventType.STAFF,
+                confidence=0.95,
+                camera_id="cam_01",
+            )
+        ])
+        snap = sm.get_metrics_snapshot()
+        assert snap["staff_count"] == 1
+
+    def test_group_entry_counts_as_footfall(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = _state_with_events([
+            _entry(1, t0, EventType.GROUP_ENTRY),
+            _entry(2, t0, EventType.GROUP_ENTRY),
+        ])
+        snap = sm.get_metrics_snapshot()
+        assert snap["footfall"] == 2
+
+
+class TestFunnel:
+    def test_funnel_conversion_below_100_percent(self):
+        t0 = datetime(2026, 4, 10, 12, 0, 0)
+        sm = StateManager()
+        for pid in range(1, 6):
+            sm.add_event(_entry(pid, t0))
+        sm.set_buyer_count(2)
+
+        import analytics.funnel as funnel_mod
+        funnel_mod.state_manager = sm
+        funnel = compute_funnel()
+        assert funnel.conversion_rate <= 1.0
+        assert funnel.converted == 2
+
+    def test_funnel_zeros_when_no_visitors(self):
+        sm = StateManager()
+        import analytics.funnel as funnel_mod
+        funnel_mod.state_manager = sm
+        funnel = compute_funnel()
+        assert funnel.entered == 0
+        assert funnel.conversion_rate == 0.0

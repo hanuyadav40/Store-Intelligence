@@ -1,151 +1,144 @@
-# Purplle Store Intelligence System
+# Store Intelligence — README
 
-Retail analytics platform: raw CCTV footage → structured events → REST API + live dashboard.
-
-**Stack:** Python 3.12 · FastAPI · YOLOv8 · ByteTrack · PostgreSQL 16 · Redis 7 · Docker Compose
-
----
-
-## Quick Start (5 commands)
+## Quick Start
 
 ```bash
-git clone <repo-url> && cd store-intelligence
+# 1. Clone / open the project
+cd store-intelligence
 
-# 1. Copy environment config
-cp .env.example .env
+# 2. (Optional) Place video footage in data/
+#    e.g.  cp /path/to/store.mp4 data/
+#    e.g.  cp /path/to/sales.csv data/sales.csv
 
-# 2. Start all services (API + DB + Redis + Dashboard)
+# 3. Single command to build and run
 docker compose up --build
-
-# 3. (Optional) Run detection pipeline on real CCTV footage
-#    Place CAM 1.mp4 … CAM 5.mp4 in CCTV Footage/ then:
-docker compose run --rm pipeline bash pipeline/run.sh
-
-# 4. Run simulation mode (no video files needed)
-docker compose run --rm pipeline bash pipeline/run.sh --simulate
-
-# 5. Run acceptance assertions
-python data/assertions.py
 ```
 
-API docs auto-open at **http://localhost:8000/docs**  
-Live dashboard at **http://localhost:3000**
+The API is available at **http://localhost:8000**
+Prometheus metrics scrape endpoint: **http://localhost:8001**
 
 ---
 
-## Architecture
+## API Endpoints
 
-```
-CCTV Footage (5 × .mp4)
-        │
-        ▼
-pipeline/detect.py          ← YOLOv8n + ByteTrack + ReID (HOG+colour histogram)
-        │ POST /events/ingest
-        ▼
-FastAPI (port 8000)
-   ├── POST /events/ingest   ← batch ingestion, idempotency, session management
-   ├── GET  /stores/{id}/metrics
-   ├── GET  /stores/{id}/funnel
-   ├── GET  /stores/{id}/heatmap
-   ├── GET  /stores/{id}/anomalies
-   ├── GET  /health
-   └── GET  /dashboard/stream/{id}  ← SSE live feed
-        │
-        ├── PostgreSQL 16   ← events, visitor_sessions, pos_transactions
-        └── Redis 7         ← SSE pub/sub caching
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Liveness probe |
+| `/metrics` | GET | Store business metrics |
+| `/funnel` | GET | Customer journey funnel |
+| `/events` | GET | Event stream (supports `?limit=N&event_type=ENTRY`) |
+| `/anomalies` | GET | Detected anomaly alerts |
+| `/process` | POST | Upload and process a video file |
+| `/docs` | GET | Auto-generated OpenAPI UI |
 
-Dashboard (port 3000)
-   └── Chart.js real-time KPI dashboard consuming SSE stream
-```
+### Sample responses
 
----
-
-## Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/events/ingest` | Ingest batch of store events (max 500) |
-| `GET`  | `/stores/{store_id}/metrics` | Real-time KPIs for a store |
-| `GET`  | `/stores/{store_id}/funnel` | 4-stage conversion funnel |
-| `GET`  | `/stores/{store_id}/heatmap` | Zone visit heatmap (0–100 normalised) |
-| `GET`  | `/stores/{store_id}/anomalies` | Active anomalies (QUEUE_SPIKE, CONVERSION_DROP, DEAD_ZONE) |
-| `GET`  | `/health` | Service health + per-store feed staleness |
-| `GET`  | `/dashboard/stream/{store_id}` | SSE real-time metrics stream |
-
----
-
-## Event Schema
-
+**GET /metrics**
 ```json
 {
-  "event_id":   "550e8400-e29b-41d4-a716-446655440000",  // UUID v4
-  "store_id":   "STORE_BLR_001",
-  "camera_id":  "CAM_BLR_001_FLOOR",
-  "visitor_id": "visitor-abc123",
-  "event_type": "ZONE_ENTER",   // ENTRY|EXIT|ZONE_ENTER|ZONE_EXIT|ZONE_DWELL|BILLING_QUEUE_JOIN|BILLING_QUEUE_ABANDON|REENTRY
-  "timestamp":  "2026-03-03T10:15:30Z",
-  "zone_id":    "SKINCARE",
-  "dwell_ms":   45000,
-  "is_staff":   false,
-  "confidence": 0.92,
-  "metadata":   {"queue_depth": 3, "sku_zone": "SKINCARE", "session_seq": 2}
+  "footfall": 142,
+  "unique_visitors": 119,
+  "conversion_rate": 0.21,
+  "avg_dwell_time": 384.5,
+  "current_occupancy": 7,
+  "total_exits": 135,
+  "revisit_rate": 0.09,
+  "staff_count": 3,
+  "timestamp": "2026-04-10T17:30:00"
 }
 ```
 
----
+**GET /funnel**
+```json
+{
+  "entered": 119,
+  "engaged": 87,
+  "converted": 25,
+  "engagement_rate": 0.73,
+  "conversion_rate": 0.21
+}
+```
 
-## Detection Pipeline
-
-```bash
-# Process single video
-python pipeline/detect.py \
-  --video "/data/cctv/CAM 1.mp4" \
-  --store STORE_BLR_001 \
-  --camera CAM_BLR_001_ENTRY \
-  --layout data/store_layout.json \
-  --api-url http://localhost:8000
-
-# Simulation mode (no video required)
-python pipeline/detect.py \
-  --simulate \
-  --store STORE_BLR_001 \
-  --camera CAM_BLR_001_FLOOR \
-  --layout data/store_layout.json \
-  --api-url http://localhost:8000 \
-  --sim-visitors 30
+**GET /events?limit=3**
+```json
+[
+  {"event_id": "...", "person_id": 42, "event_type": "ENTRY",  "confidence": 0.91, "camera_id": "cam_01", "timestamp": "..."},
+  {"event_id": "...", "person_id": 43, "event_type": "GROUP_ENTRY", "confidence": 0.88, "camera_id": "cam_01", "timestamp": "..."},
+  {"event_id": "...", "person_id": 41, "event_type": "EXIT",   "confidence": 0.94, "camera_id": "cam_01", "timestamp": "..."}
+]
 ```
 
 ---
 
-## Running Tests
+## Local Development (without Docker)
 
 ```bash
-pip install -r requirements-dev.txt
-pytest --cov=app --cov-report=term-missing
-```
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
 
-Tests use in-memory SQLite via `aiosqlite`. No Postgres or Redis required.  
-Minimum coverage enforced: **70%** (see `pytest.ini`).
+# Run the API
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# Run tests
+pytest tests/ -v --cov=. --cov-report=term-missing
+```
 
 ---
 
 ## Configuration
 
-Key environment variables (see `.env.example` for full list):
+All settings are controlled via environment variables (see `.env.example`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `postgresql+asyncpg://...` | Async DB URL (runtime) |
-| `SYNC_DATABASE_URL` | `postgresql+psycopg2://...` | Sync DB URL (Alembic) |
-| `REDIS_URL` | `redis://redis:6379/0` | Redis connection |
-| `REID_SIMILARITY_THRESHOLD` | `0.72` | ReID cosine match threshold |
-| `REENTRY_WINDOW_SECONDS` | `300` | Window to detect re-entries |
-| `STAFF_TRACK_RATIO` | `0.80` | Fraction of frames for staff classification |
-| `QUEUE_SPIKE_WARN_THRESHOLD` | `5` | Queue depth for WARN anomaly |
-| `QUEUE_SPIKE_CRITICAL_THRESHOLD` | `10` | Queue depth for CRITICAL anomaly |
+| `DEMO_MODE` | `true` | Use synthetic data when no video found |
+| `DATA_DIR` | `/app/data` | Directory scanned for video files |
+| `SALES_CSV_PATH` | `/app/data/sales.csv` | Sales data for conversion rate |
+| `YOLO_MODEL` | `yolov8n.pt` | YOLO model variant |
+| `CONFIDENCE_THRESHOLD` | `0.4` | Detection confidence floor |
+| `SESSION_WINDOW_MINUTES` | `30` | Unique-visitor session window |
+| `ENTRY_LINE_Y_FRACTION` | `0.4` | Virtual entry line position |
+| `CROWD_THRESHOLD` | `10` | Occupancy threshold for crowd alert |
 
 ---
 
-## Store Layout
+## Adding Real Video
 
-`data/store_layout.json` defines 5 stores (STORE_BLR_001, STORE_BLR_002, STORE_MUM_001, STORE_DEL_001, STORE_HYD_001) with 3 cameras each (entry/floor/billing), zone bounding boxes (normalised 0–1), and source video file mappings.
+1. Drop a `.mp4` / `.avi` file into `data/`
+2. Optionally copy `sales.csv` into `data/` for real conversion metrics
+3. `docker compose up --build`
+
+The system auto-detects the video and switches from demo to real-video mode.
+
+---
+
+## Project Structure
+
+```
+store-intelligence/
+├── app/
+│   ├── main.py                # FastAPI app + startup
+│   ├── api/routes.py          # All endpoints
+│   ├── models/                # Pydantic schemas
+│   ├── services/
+│   │   ├── state_manager.py   # Thread-safe event/metric store
+│   │   └── video_processor.py # Video + demo pipeline orchestration
+│   └── utils/                 # Config + structured logging
+├── detector/
+│   ├── detector.py            # YOLOv8n wrapper
+│   ├── tracker.py             # ByteTrack wrapper
+│   └── event_generator.py     # Virtual line + business rules
+├── analytics/
+│   ├── metrics.py             # Business metrics calculator
+│   ├── funnel.py              # Customer journey funnel
+│   └── anomalies.py           # Spike / dwell / crowd detection
+├── tests/                     # pytest unit + integration + edge-case tests
+├── data/                      # Mount point for videos and CSVs
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── DESIGN.md
+└── CHOICES.md
+```
